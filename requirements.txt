@@ -1,0 +1,7 @@
+requests
+tqdm
+pandas
+matplotlib
+seaborn
+jupyter
+nbconvert
