@@ -14,21 +14,37 @@ fetch_bonds.py  ─►  fetch_bonds_detail.py  ─►  filter_bonds.py  ─►  
 |---|---|---|---|
 | `fetch_bonds.py` | — | `bonds_tickers.csv` | Список всех облигаций (постранично) |
 | `fetch_bonds_detail.py` | `bonds_tickers.csv` | `bonds_detail.csv` | Детали по каждой бумаге. Resume, случайная задержка против троттлинга |
-| `filter_bonds.py` | `bonds_detail.csv` | `bonds_filtered.csv` | Фильтр под стратегию (ежемесячный купон) |
+| `filter_bonds.py` | `bonds_detail.csv` | `bonds_filtered.csv` | Фильтр под стратегию (ежемесячный купон) + флаг залогового обеспечения |
 | `bonds_analysis.ipynb` | `bonds_filtered.csv` | `bonds_analysis.html` | Топы по группам надёжности, графики |
 
 ## Запуск
 
+Весь пайплайн запускается **прямо из блокнота** — отдельно гонять скрипты не нужно.
+
 ```bash
 pip install -r requirements.txt
+jupyter lab bonds_analysis.ipynb   # открыть и выполнить все ячейки
+```
 
+Первая ячейка блокнота — «Пайплайн данных». По умолчанию берутся готовые CSV, а любой шаг
+запускается сам, если его файла нет. Чтобы обновить данные, поставь нужный флаг в `True`:
+
+```python
+FETCH_TICKERS = False   # список облигаций с биржи (~30 сек)
+FETCH_DETAIL  = False   # детали по каждой бумаге (ДОЛГО, ~25 мин)
+RUN_FILTER    = False   # шортлист + флаг залога (~1 мин)
+```
+
+<details>
+<summary>Запуск отдельными скриптами (опционально)</summary>
+
+```bash
 python fetch_bonds.py            # -> bonds_tickers.csv
 python fetch_bonds_detail.py     # -> bonds_detail.csv (долго, ~25 мин)
 python filter_bonds.py           # -> bonds_filtered.csv
-
-jupyter nbconvert --to notebook --execute --inplace bonds_analysis.ipynb
-jupyter nbconvert --to html bonds_analysis.ipynb   # -> bonds_analysis.html
+jupyter nbconvert --to html --execute bonds_analysis.ipynb   # -> bonds_analysis.html
 ```
+</details>
 
 ## Данные
 
