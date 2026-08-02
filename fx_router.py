@@ -70,7 +70,8 @@ class Config:
     # Фильтры мейкеров
     min_recent_order_num: int = 100
     min_recent_execute_rate: float = 99.0
-    antiscam_threshold: float = 0.01  # отклонение от медианы топ-10 (+1%)
+    antiscam_threshold: float = 0.02  # отклонение от медианы ВСЕХ валидных (+2%)
+    max_ad_age_hours: float = 336.0   # объявления старше 14 дней — мусор (цены неактуальны)
     blacklist_keywords: tuple[str, ...] = ("pyypl", "доверенн")
 
     # Поиск путей
@@ -110,6 +111,7 @@ class Maker:
     is_online: bool = False            # онлайн ли мейкер
     nickname: str = ""                 # никнейм
     remark: str = ""                   # условие объявления (для blacklist)
+    create_date_ms: int = 0            # когда создано объявление (ms epoch, 0 = неизвестно)
 
     @property
     def url(self) -> str:
@@ -201,9 +203,12 @@ def fetch_ads(
 ) -> list[dict[str, Any]]:
     """Запросить P2P-объявления Bybit.
 
-    Хитрость: Bybit возвращает дорогие объявления на первых страницах,
-    а дешёвые — на последних. Поэтому сначала узнаём общее количество
-    через page=1, а потом запрашиваем последние N страниц, где лучшие цены.
+    Раньше скрипт тянул ПОСЛЕДНИЕ страницы в надежде найти самые дешёвые
+    объявления. На практике сортировка api2.bybit.com нестабильна
+    (иногда дешёвые сначала, иногда с конца), а в конце стакана копятся
+    годами не обновлявшиеся объявления с неактуальными ценами — на них
+    скрипт и покупался. Поэтому берём первые N страниц и полагаемся на
+    фильтры свежести и анти-скам в filter_makers().
     """
     use_v5 = bool(cfg.bybit_api_key and cfg.bybit_api_secret)
     page_size = cfg.bybit_p2p_page_size
@@ -241,11 +246,10 @@ def fetch_ads(
     # Сколько всего страниц?
     total_pages = max(1, math.ceil(total / page_size)) if total > 0 else 1
 
-    # Запрашиваем последние N страниц (самые дешёвые)
+    # Берём первые N страниц с начала (не с конца!)
     pages_to_fetch = min(cfg.bybit_p2p_pages, total_pages)
-    start_page = max(2, total_pages - pages_to_fetch + 1)
 
-    for p in range(start_page, total_pages + 1):
+    for p in range(2, pages_to_fetch + 1):
         try:
             items, _ = _make_request(p)
             all_items.extend(items)
@@ -254,9 +258,9 @@ def fetch_ads(
             continue
 
     log.info(
-        "Fetched %d ads for %s→%s side=%s (%s, pages 1+%s..%s of %s)",
+        "Fetched %d ads for %s→%s side=%s (%s, pages 1..%s of %s)",
         len(all_items), currency_id, token_id, side,
-        "v5" if use_v5 else "public", start_page, total_pages, total_pages,
+        "v5" if use_v5 else "public", pages_to_fetch, total_pages,
     )
     return all_items
 
@@ -296,6 +300,7 @@ def parse_makers(items: list[dict[str, Any]]) -> list[Maker]:
                 is_online=is_online,
                 nickname=nickname,
                 remark=remark,
+                create_date_ms=_i64(item, "createDate"),
             )
             makers.append(maker)
         except (ValueError, TypeError):
@@ -313,6 +318,17 @@ def _f(d: dict, *keys: str) -> float:
             except (ValueError, TypeError):
                 pass
     return 0.0
+
+
+def _i64(d: dict, key: str) -> int:
+    """Достать int из dict (значение может быть str или число)."""
+    v = d.get(key)
+    if v is None:
+        return 0
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return 0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -336,9 +352,11 @@ def filter_makers(
     * мейкер онлайн
     * лимиты объявления вмещают сумму
     * условие не содержит blacklist-подстрок
-    * анти-скам: курс не лучше медианы топ-10 более чем на 1%
+    * объявление свежее ``max_ad_age_hours`` (иначе цена неактуальна)
+    * анти-скам: курс не отклоняется от медианы ВСЕХ валидных больше чем на ``antiscam_threshold``
     """
     total = len(makers)
+    now_ms = time.time() * 1000
 
     # Базовые фильтры
     valid: list[Maker] = []
@@ -350,6 +368,9 @@ def filter_makers(
         if m.recent_execute_rate < cfg.min_recent_execute_rate:
             continue
         if amount and (amount < m.min_amount or amount > m.max_amount):
+            continue
+        # Свежесть: старые объявления висят годами с ценами из другой эпохи
+        if m.create_date_ms > 0 and (now_ms - m.create_date_ms) > cfg.max_ad_age_hours * 3600_000:
             continue
 
         # Blacklist по условиям
@@ -370,16 +391,17 @@ def filter_makers(
         # Слишком мало мейкеров — дальше не фильтруем
         return valid
 
-    # Анти-скам: отбрасываем аномальные курсы (двусторонний фильтр)
-    # Оставляем цены в пределах threshold от медианы топ-10
-    sorted_by_price = sorted(valid, key=lambda m: m.price)
-    top10 = sorted_by_price[:10]
-    median_top10 = statistics.median(m.price for m in top10)
-    lower = median_top10 * (1.0 - cfg.antiscam_threshold)
-    upper = median_top10 * (1.0 + cfg.antiscam_threshold)
+    # Анти-скам: отбрасываем аномальные курсы относительно медианы
+    # ВСЕХ валидных объявлений (а не топ-10 самых дешёвых — на них
+    # кучкуется старый скам-мусор по одной цене).
+    prices = sorted(m.price for m in valid)
+    median = statistics.median(prices)
+    lower = median * (1.0 - cfg.antiscam_threshold)
+    upper = median * (1.0 + cfg.antiscam_threshold)
     result = [m for m in valid if lower <= m.price <= upper]
 
-    log.info("  anti-scam filter: %d → %d", len(valid), len(result))
+    log.info("  anti-scam filter: %d → %d (median=%.4f, band %.4f..%.4f)",
+             len(valid), len(result), median, lower, upper)
     return result
 
 
