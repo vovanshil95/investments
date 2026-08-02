@@ -80,6 +80,10 @@ class Config:
     pay_in_methods: tuple[str, ...] = ()
     pay_out_methods: tuple[str, ...] = ()
 
+    # Конверсии Freedom Bank (bankffin.kz) как рёбра графа фиат→фиат
+    use_bank_edges: bool = False
+    bank_rates_section: str = "mobile"   # "mobile" — приложение, "cash" — отделение
+
     # Поиск путей
     max_hops: int = 3
     amount_rub: float = 100_000.0  # сумма сделки в RUB
@@ -135,8 +139,9 @@ class Edge:
     source: str          # валюта-источник (RUB, USDT, …)
     target: str          # целевая валюта
     rate: float          # эффективный курс (source → target)
-    makers: list[Maker]  # мейкеры, по которым считали
-    side: str            # "0" — юзер покупает крипту, "1" — продаёт
+    makers: list[Maker]  # мейкеры, по которым считали (пусто для банковских рёбер)
+    side: str            # "0" — юзер покупает крипту, "1" — продаёт, "bank" — конверсия банка
+    is_bank: bool = False  # ребро — конверсия Freedom Bank по официальному курсу
 
 
 @dataclass
@@ -404,6 +409,51 @@ def resolve_payment_ids(specs: tuple[str, ...], id2name: dict[str, str]) -> set[
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Курсы конверсии Freedom Bank (bankffin.kz)
+# ──────────────────────────────────────────────────────────────────────
+
+_BANK_RATES_URL = "https://bankffin.kz/api/exchange-rates/getRates"
+
+
+def fetch_bank_rates(section: str = "mobile") -> dict[tuple[str, str], float]:
+    """Официальные курсы Freedom Bank → dict[(from, to)] = курс.
+
+    Для пары (buyCode=A, sellCode=B, buyRate=b, sellRate=s):
+      * A → B = b      — продаёшь A банку, получаешь B за единицу A
+      * B → A = 1/s    — покупаешь A у банка, платишь B за единицу A
+
+    ``section``: "mobile" — тариф мобильного приложения, "cash" — отделения.
+    При ошибке возвращает {}.
+    """
+    try:
+        with httpx.Client() as client:
+            resp = client.get(_BANK_RATES_URL, timeout=10.0)
+            data = resp.json().get("data", {})
+        rates: dict[tuple[str, str], float] = {}
+        for row in data.get(section) or []:
+            a = str(row.get("buyCode", ""))
+            b = str(row.get("sellCode", ""))
+            if not a or not b or a == b:
+                continue
+            def _num(v: str) -> float | None:
+                try:
+                    return float(str(v).replace(" ", "").replace(",", "."))
+                except ValueError:
+                    return None
+            buy = _num(row.get("buyRate", ""))
+            sell = _num(row.get("sellRate", ""))
+            if buy and buy > 0:
+                rates[(a, b)] = buy
+            if sell and sell > 0:
+                rates[(b, a)] = 1.0 / sell
+        log.info("Freedom Bank rates (%s): %d edges", section, len(rates))
+        return rates
+    except Exception as exc:
+        log.warning("Failed to fetch Freedom Bank rates: %s", exc)
+        return {}
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Фильтры мейкеров
 # ──────────────────────────────────────────────────────────────────────
 
@@ -585,6 +635,18 @@ def build_graph(
             except Exception as exc:
                 log.warning("Error fetching pair: %s", exc)
 
+    # Рёбра конверсий Freedom Bank (фиат→фиат по официальному курсу)
+    if cfg.use_bank_edges:
+        bank_rates = fetch_bank_rates(cfg.bank_rates_section)
+        added = 0
+        for (a, b), rate in bank_rates.items():
+            if a in fiats and b in fiats and (a, b) not in edges:
+                edges[(a, b)] = Edge(
+                    source=a, target=b, rate=rate, makers=[], side="bank", is_bank=True,
+                )
+                added += 1
+        log.info("Bank edges added: %d", added)
+
     log.info("Graph built: %d edges", len(edges))
     return edges
 
@@ -624,8 +686,14 @@ def find_paths(
             min_volume = float("inf")
             for edge in edge_chain:
                 effective_rate *= edge.rate
-                # Объём: берём max_amount
-                avail = max(m.max_amount for m in edge.makers) if edge.makers else 0
+                if edge.is_bank:
+                    # Банковская конверсия — практического лимита нет (для алгоритма)
+                    avail = 1e12
+                elif edge.makers:
+                    # Объём: берём max_amount
+                    avail = max(m.max_amount for m in edge.makers)
+                else:
+                    avail = 0
                 min_volume = min(min_volume, avail)
 
             hops = len(chain) - 1
@@ -707,6 +775,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Способы ПОЛУЧЕНИЯ фиата (через запятую): ID или подстрока названия, "
              "напр. 'Freedom Bank'. Пример: --pay-out 'Freedom Bank'",
     )
+    parser.add_argument(
+        "--bank", action="store_true",
+        help="Добавить конверсии Freedom Bank (bankffin.kz) как рёбра графа фиат→фиат. "
+             "Позволяет искать цепочки вида RUB →(банк)→ KZT →(P2P)→ USDT →(P2P)→ USD",
+    )
+    parser.add_argument(
+        "--bank-section", type=str, default="mobile", choices=["mobile", "cash"],
+        help="Тариф банка для --bank: mobile (приложение) или cash (отделение). Default: mobile",
+    )
     return parser.parse_args(argv)
 
 
@@ -743,6 +820,8 @@ def main(argv: list[str] | None = None) -> None:
         bybit_api_secret=api_secret,
         pay_in_methods=tuple(s.strip() for s in args.pay_in.split(",") if s.strip()),
         pay_out_methods=tuple(s.strip() for s in args.pay_out.split(",") if s.strip()),
+        use_bank_edges=args.bank,
+        bank_rates_section=args.bank_section,
     )
 
     source = "RUB"
@@ -785,7 +864,7 @@ def main(argv: list[str] | None = None) -> None:
         route_str = " → ".join(p.chain)
         # Эффективный курс: сколько target за 1 RUB
         makers_str = " → ".join(
-            f"{e.makers[0].nickname if e.makers else '?'}"
+            "FreedomBank" if e.is_bank else (e.makers[0].nickname if e.makers else "?")
             for e in p.edges
         )
         # Инвертируем для читаемости: сколько RUB за 1 target
@@ -802,6 +881,9 @@ def main(argv: list[str] | None = None) -> None:
         rub_per_target = 1.0 / p.effective_rate if p.effective_rate > 0 else float("inf")
         print(f"--- Route #{i}: {' → '.join(p.chain)}  1 {p.chain[-1]} = {rub_per_target:.2f} {p.chain[0]} ---")
         for j, e in enumerate(p.edges):
+            if e.is_bank:
+                print(f"  Step {j+1}: 1 {e.source} → {e.rate:.6f} {e.target}  [Freedom Bank {cfg.bank_rates_section}]")
+                continue
             top3_makers = sorted(e.makers, key=lambda m: m.price)[:3]
             step_str = f"1 {e.source} → {e.rate:.6f} {e.target}"
             print(f"  Step {j+1}: {step_str}")
