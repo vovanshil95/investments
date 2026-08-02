@@ -70,7 +70,7 @@ class Config:
     # Фильтры мейкеров
     min_recent_order_num: int = 100
     min_recent_execute_rate: float = 99.0
-    antiscam_threshold: float = 0.02  # отклонение от медианы ВСЕХ валидных (+2%)
+    antiscam_threshold: float = 0.10  # отклонение от медианы всех валидных (±10%): режет старьё (-15%+), пускает реальные лучшие цены
     max_ad_age_hours: float = 336.0   # объявления старше 14 дней — мусор (цены неактуальны)
     blacklist_keywords: tuple[str, ...] = ("pyypl", "доверенн")
 
@@ -545,9 +545,16 @@ def filter_makers(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _edge_rate(makers: list[Maker]) -> float:
-    """Курс ребра = медиана топ-3 по цене для мейкера."""
-    top3 = sorted(makers, key=lambda m: m.price)[:3]
+def _edge_rate(makers: list[Maker], side: str) -> float:
+    """Курс ребра = медиана топ-3 ЛУЧШИХ по цене.
+
+    side "0" (крипта→фиат, юзер продаёт крипту): лучшие = самые ДОРОГИЕ (кто больше платит).
+    side "1" (фиат→крипта, юзер покупает): лучшие = самые ДЕШЁВЫЕ.
+    """
+    if side == "0":
+        top3 = sorted(makers, key=lambda m: m.price, reverse=True)[:3]
+    else:
+        top3 = sorted(makers, key=lambda m: m.price)[:3]
     return statistics.median(m.price for m in top3)
 
 
@@ -620,7 +627,7 @@ def build_graph(
                 log.info("  relaxed filters for %s→%s (payment filter)", src, dst)
         if len(valid) < 3:
             return None
-        raw_rate = _edge_rate(valid)
+        raw_rate = _edge_rate(valid, side)
         # side "1" (фиат→крипта): цена объявления = фиат за крипту → курс = 1/цена
         # side "0" (крипта→фиат): цена = фиат за крипту → курс = цена
         if side == "1":
@@ -900,7 +907,7 @@ def main(argv: list[str] | None = None) -> None:
             if e.is_bank:
                 print(f"  Step {j+1}: 1 {e.source} → {e.rate:.6f} {e.target}  [Freedom Bank {cfg.bank_rates_section}]")
                 continue
-            top3_makers = sorted(e.makers, key=lambda m: m.price)[:3]
+            top3_makers = sorted(e.makers, key=lambda m: m.price, reverse=(e.side == "0"))[:3]
             step_str = f"1 {e.source} → {e.rate:.6f} {e.target}"
             print(f"  Step {j+1}: {step_str}")
             for m in top3_makers:
