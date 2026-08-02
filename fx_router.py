@@ -88,9 +88,6 @@ class Config:
     max_hops: int = 3
     amount_rub: float = 100_000.0  # сумма сделки в RUB
 
-    # Скоринг
-    hop_penalty: float = 0.005  # log-штраф за каждое ребро сверх двух
-
     # HTTP
     http_timeout: float = 15.0
 
@@ -697,7 +694,7 @@ def find_paths(
                 min_volume = min(min_volume, avail)
 
             hops = len(chain) - 1
-            score = math.log(effective_rate) - cfg.hop_penalty * max(0, hops - 2)
+            score = math.log(effective_rate)
 
             results.append(PathResult(
                 chain=list(chain),
@@ -856,9 +853,8 @@ def main(argv: list[str] | None = None) -> None:
         print(f"No routes found from {source} to {target} (max {cfg.max_hops} hops)")
         sys.exit(0)
 
-    # Сортировка: СТРОГО по выгодности — чем больше target за 1 RUB, тем выше.
-    # Число хопов — только тайбрейк при равном курсе (меньше хопов = выше).
-    paths.sort(key=lambda p: (p.effective_rate, -len(p.chain)), reverse=True)
+    # Сортировка: чисто по выгодности — чем больше target за 1 RUB, тем выше.
+    paths.sort(key=lambda p: p.effective_rate, reverse=True)
     top = paths[:max(1, args.top)]
 
     print()
