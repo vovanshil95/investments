@@ -75,8 +75,8 @@ class Config:
     blacklist_keywords: tuple[str, ...] = ("pyypl", "доверенн")
 
     # Фильтры способов оплаты (по ID или подстроке названия, например "Freedom Bank").
-    # pay_in_methods — как юзер ПЛАТИТ за крипту (side=0, фиат→крипта).
-    # pay_out_methods — как юзер ПОЛУЧАЕТ фиат (side=1, крипта→фиат).
+    # pay_in_methods — как юзер ПЛАТИТ за крипту (side=1, фиат→крипта, мейкеры продают).
+    # pay_out_methods — как юзер ПОЛУЧАЕТ фиат (side=0, крипта→фиат, мейкеры покупают).
     pay_in_methods: tuple[str, ...] = ()
     pay_out_methods: tuple[str, ...] = ()
 
@@ -137,7 +137,7 @@ class Edge:
     target: str          # целевая валюта
     rate: float          # эффективный курс (source → target)
     makers: list[Maker]  # мейкеры, по которым считали (пусто для банковских рёбер)
-    side: str            # "0" — юзер покупает крипту, "1" — продаёт, "bank" — конверсия банка
+    side: str            # "1" — мейкеры продают крипту, "0" — мейкеры покупают, "bank" — конверсия банка
     is_bank: bool = False  # ребро — конверсия Freedom Bank по официальному курсу
 
 
@@ -206,7 +206,7 @@ def _fetch_page(
 def fetch_ads(
     token_id: str,
     currency_id: str,
-    side: str,  # "0" — юзер покупает, "1" — продаёт
+    side: str,  # "1" — мейкеры ПРОДАЮТ крипту (юзер покупает), "0" — мейкеры ПОКУПАЮТ (юзер продаёт)
     cfg: Config,
     client: httpx.Client,
 ) -> list[dict[str, Any]]:
@@ -457,7 +457,7 @@ def fetch_bank_rates(section: str = "mobile") -> dict[tuple[str, str], float]:
 
 def filter_makers(
     makers: list[Maker],
-    side: str,         # "0" — покупаем крипту, "1" — продаём
+    side: str,         # "1" — покупаем крипту (мейкеры продают), "0" — продаём (мейкеры покупают)
     amount: float,     # сумма сделки в фиате объявления (0 = пропустить лимитную проверку)
     cfg: Config,
     required_payment_ids: set[str] | None = None,
@@ -588,18 +588,21 @@ def build_graph(
                 continue
 
             if src in fiats and dst in cryptos:
-                # Фиат→крипта: проверяем сумму только если source — RUB
+                # Фиат→крипта (юзер ПОКУПАЕТ крипту): нужны объявления «Продам» = side "1"
+                # (side "0" на api2 возвращает «Куплю» — там юзер может только продать крипту)
                 amt = cfg.amount_rub if src == "RUB" else 0.0
-                pairs.append((src, dst, src, dst, "0", amt))
+                pairs.append((src, dst, src, dst, "1", amt))
             elif src in cryptos and dst in fiats:
-                # Крипта→фиат: сумма в крипте неизвестна до построения пути
-                pairs.append((src, dst, dst, src, "1", 0.0))
+                # Крипта→фиат (юзер ПРОДАЁТ крипту): нужны объявления «Куплю» = side "0"
+                # сумма в крипте неизвестна до построения пути
+                pairs.append((src, dst, dst, src, "0", 0.0))
             # else: skip fiat↔️fiat or crypto↔️crypto
 
     def _fetch_one(pair: tuple[str, str, str, str, str, float]) -> tuple[tuple[str, str], Edge] | None:
         """Запросить и отфильтровать одну пару. Вызывается в ThreadPool."""
         src, dst, fiat_currency, token_id, side, step_amount = pair
-        req_pay = pay_in_ids if side == "0" else pay_out_ids
+        # side "1" = покупаем крипту (платим фиат) → фильтр pay_in; side "0" = продаём → pay_out
+        req_pay = pay_in_ids if side == "1" else pay_out_ids
         with httpx.Client() as client:
             raw = fetch_ads(token_id, fiat_currency, side, cfg, client)
         makers = parse_makers(raw)
@@ -614,7 +617,9 @@ def build_graph(
         if len(valid) < 3:
             return None
         raw_rate = _edge_rate(valid)
-        if side == "0":
+        # side "1" (фиат→крипта): цена объявления = фиат за крипту → курс = 1/цена
+        # side "0" (крипта→фиат): цена = фиат за крипту → курс = цена
+        if side == "1":
             rate = 1.0 / raw_rate
         else:
             rate = raw_rate
