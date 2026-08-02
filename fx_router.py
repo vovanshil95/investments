@@ -74,6 +74,12 @@ class Config:
     max_ad_age_hours: float = 336.0   # объявления старше 14 дней — мусор (цены неактуальны)
     blacklist_keywords: tuple[str, ...] = ("pyypl", "доверенн")
 
+    # Фильтры способов оплаты (по ID или подстроке названия, например "Freedom Bank").
+    # pay_in_methods — как юзер ПЛАТИТ за крипту (side=0, фиат→крипта).
+    # pay_out_methods — как юзер ПОЛУЧАЕТ фиат (side=1, крипта→фиат).
+    pay_in_methods: tuple[str, ...] = ()
+    pay_out_methods: tuple[str, ...] = ()
+
     # Поиск путей
     max_hops: int = 3
     amount_rub: float = 100_000.0  # сумма сделки в RUB
@@ -112,6 +118,7 @@ class Maker:
     nickname: str = ""                 # никнейм
     remark: str = ""                   # условие объявления (для blacklist)
     create_date_ms: int = 0            # когда создано объявление (ms epoch, 0 = неизвестно)
+    payments: list[str] = field(default_factory=list)  # ID способов оплаты мейкера
 
     @property
     def url(self) -> str:
@@ -286,6 +293,7 @@ def parse_makers(items: list[dict[str, Any]]) -> list[Maker]:
             remark = str(item.get("remark", "") or "")
             token = str(item.get("tokenId", ""))
             currency = str(item.get("currencyId", ""))
+            payments = [str(p) for p in (item.get("payments") or [])]
 
             maker = Maker(
                 ad_id=str(item.get("id", item.get("itemId", "")) or ""),
@@ -301,6 +309,7 @@ def parse_makers(items: list[dict[str, Any]]) -> list[Maker]:
                 nickname=nickname,
                 remark=remark,
                 create_date_ms=_i64(item, "createDate"),
+                payments=payments,
             )
             makers.append(maker)
         except (ValueError, TypeError):
@@ -332,6 +341,69 @@ def _i64(d: dict, key: str) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Справочник способов оплаты Bybit (id → название)
+# ──────────────────────────────────────────────────────────────────────
+
+_PAYMENT_DICT_URL = "https://api2.bybit.com/fiat/otc/configuration/queryAllPaymentList"
+_payment_dict: dict[str, str] | None = None
+
+
+def load_payment_dict(client: httpx.Client | None = None) -> dict[str, str]:
+    """Загрузить справочник способов оплаты {paymentType: paymentName}.
+
+    Результат кэшируется в модульной переменной. При ошибке возвращает {}.
+    """
+    global _payment_dict
+    if _payment_dict is not None:
+        return _payment_dict
+    try:
+        own = client is None
+        client = client or httpx.Client()
+        try:
+            resp = client.post(_PAYMENT_DICT_URL, json={}, timeout=10.0)
+            data = resp.json()
+        finally:
+            if own:
+                client.close()
+        d: dict[str, str] = {}
+        for cfg in (data.get("result", {}).get("paymentConfigVo") or []):
+            pid = cfg.get("paymentType")
+            nm = cfg.get("paymentName")
+            if pid and nm:
+                d[str(pid)] = str(nm)
+        _payment_dict = d
+        log.info("Payment dict loaded: %d methods", len(d))
+    except Exception as exc:
+        log.warning("Failed to load payment dict: %s", exc)
+        _payment_dict = {}
+    return _payment_dict
+
+
+def resolve_payment_ids(specs: tuple[str, ...], id2name: dict[str, str]) -> set[str]:
+    """Преобразовать список способов оплаты в множество ID.
+
+    Каждый spec может быть числовым ID ("549") или подстрокой названия
+    ("freedom" → Freedom Bank). Регистр не важен.
+    """
+    ids: set[str] = set()
+    for spec in specs:
+        s = spec.strip()
+        if not s:
+            continue
+        if s.isdigit():
+            ids.add(s)
+            continue
+        matched = {pid for pid, name in id2name.items() if s.lower() in name.lower()}
+        if matched:
+            ids.update(matched)
+            log.info("  payment '%s' → IDs %s (%s)", s, sorted(matched),
+                     ", ".join(id2name.get(m, "?") for m in sorted(matched)))
+        else:
+            log.warning("  payment '%s' не найден в справочнике", s)
+    return ids
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Фильтры мейкеров
 # ──────────────────────────────────────────────────────────────────────
 
@@ -341,36 +413,48 @@ def filter_makers(
     side: str,         # "0" — покупаем крипту, "1" — продаём
     amount: float,     # сумма сделки в фиате объявления (0 = пропустить лимитную проверку)
     cfg: Config,
+    required_payment_ids: set[str] | None = None,
+    relaxed: bool = False,
 ) -> list[Maker]:
     """Отфильтровать мейкеров по критериям качества.
 
     Если ``amount`` == 0, проверка лимитов (minAmount/maxAmount) пропускается —
     это нужно при построении графа, когда реальный объём ещё неизвестен.
 
-    * ``recentOrderNum >= min_recent_order_num``
-    * ``recentExecuteRate >= min_recent_execute_rate``
+    ``relaxed=True`` — ослабленные пороги для тонких рынков (например, когда
+    активен фильтр способа оплаты): не проверяется свежесть, достаточно
+    30 сделок и 97% выполнения.
+
+    * ``recentOrderNum >= min_recent_order_num`` (30 в relaxed)
+    * ``recentExecuteRate >= min_recent_execute_rate`` (97% в relaxed)
     * мейкер онлайн
     * лимиты объявления вмещают сумму
     * условие не содержит blacklist-подстрок
-    * объявление свежее ``max_ad_age_hours`` (иначе цена неактуальна)
+    * объявление свежее ``max_ad_age_hours`` (пропускается в relaxed)
+    * если ``required_payment_ids`` задан — мейкер поддерживает хотя бы один из них
     * анти-скам: курс не отклоняется от медианы ВСЕХ валидных больше чем на ``antiscam_threshold``
     """
     total = len(makers)
     now_ms = time.time() * 1000
+    min_orders = 30 if relaxed else cfg.min_recent_order_num
+    min_exec = 97.0 if relaxed else cfg.min_recent_execute_rate
 
     # Базовые фильтры
     valid: list[Maker] = []
     for m in makers:
         if not m.is_online:
             continue
-        if m.recent_order_num < cfg.min_recent_order_num:
+        if m.recent_order_num < min_orders:
             continue
-        if m.recent_execute_rate < cfg.min_recent_execute_rate:
+        if m.recent_execute_rate < min_exec:
             continue
         if amount and (amount < m.min_amount or amount > m.max_amount):
             continue
         # Свежесть: старые объявления висят годами с ценами из другой эпохи
-        if m.create_date_ms > 0 and (now_ms - m.create_date_ms) > cfg.max_ad_age_hours * 3600_000:
+        if not relaxed and m.create_date_ms > 0 and (now_ms - m.create_date_ms) > cfg.max_ad_age_hours * 3600_000:
+            continue
+        # Способ оплаты: мейкер должен поддерживать хотя бы один из требуемых
+        if required_payment_ids and not (set(m.payments) & required_payment_ids):
             continue
 
         # Blacklist по условиям
@@ -433,6 +517,15 @@ def build_graph(
     all_currencies: list[str] = list(cfg.fiat_currencies) + list(cfg.crypto_currencies)
     edges: dict[tuple[str, str], Edge] = {}
 
+    # Резолвим способы оплаты в ID (по названию или ID) один раз
+    id2name = load_payment_dict()
+    pay_in_ids = resolve_payment_ids(cfg.pay_in_methods, id2name) if cfg.pay_in_methods else set()
+    pay_out_ids = resolve_payment_ids(cfg.pay_out_methods, id2name) if cfg.pay_out_methods else set()
+    if pay_in_ids:
+        log.info("Pay-in filter: %s", sorted(pay_in_ids))
+    if pay_out_ids:
+        log.info("Pay-out filter: %s", sorted(pay_out_ids))
+
     # Для каждой пары (source, target), где source != target
     # Ребро существует если source и target разной природы (fiat↔️crypto)
     # или обе одного типа — тоже можно, но нереалистично на P2P
@@ -459,12 +552,18 @@ def build_graph(
     def _fetch_one(pair: tuple[str, str, str, str, str, float]) -> tuple[tuple[str, str], Edge] | None:
         """Запросить и отфильтровать одну пару. Вызывается в ThreadPool."""
         src, dst, fiat_currency, token_id, side, step_amount = pair
+        req_pay = pay_in_ids if side == "0" else pay_out_ids
         with httpx.Client() as client:
             raw = fetch_ads(token_id, fiat_currency, side, cfg, client)
         makers = parse_makers(raw)
         if not makers:
             return None
-        valid = filter_makers(makers, side, step_amount, cfg)
+        valid = filter_makers(makers, side, step_amount, cfg, req_pay or None)
+        if len(valid) < 3 and req_pay:
+            # Тонкий рынок (фильтр оплаты): пробуем ослабленные пороги
+            valid = filter_makers(makers, side, step_amount, cfg, req_pay or None, relaxed=True)
+            if len(valid) >= 3:
+                log.info("  relaxed filters for %s→%s (payment filter)", src, dst)
         if len(valid) < 3:
             return None
         raw_rate = _edge_rate(valid)
@@ -598,7 +697,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--api-secret", type=str, default="",
         help="Bybit API secret (для подписи V5 запросов)",
     )
+    parser.add_argument(
+        "--pay-in", type=str, default="",
+        help="Способы оплаты за крипту (через запятую): ID или подстрока названия, "
+             "напр. 'СБП' или '549'. Пример: --pay-in 'Tinkoff,СБП'",
+    )
+    parser.add_argument(
+        "--pay-out", type=str, default="",
+        help="Способы ПОЛУЧЕНИЯ фиата (через запятую): ID или подстрока названия, "
+             "напр. 'Freedom Bank'. Пример: --pay-out 'Freedom Bank'",
+    )
     return parser.parse_args(argv)
+
+
+def _payment_names(maker: Maker, id2name: dict[str, str]) -> str:
+    """Названия способов оплаты мейкера через запятую."""
+    if not maker.payments:
+        return ""
+    names = [id2name.get(p, f"id:{p}") for p in maker.payments[:4]]
+    more = f" +{len(maker.payments) - 4}" if len(maker.payments) > 4 else ""
+    return ", ".join(names) + more
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -623,6 +741,8 @@ def main(argv: list[str] | None = None) -> None:
         max_hops=args.max_hops,
         bybit_api_key=api_key,
         bybit_api_secret=api_secret,
+        pay_in_methods=tuple(s.strip() for s in args.pay_in.split(",") if s.strip()),
+        pay_out_methods=tuple(s.strip() for s in args.pay_out.split(",") if s.strip()),
     )
 
     source = "RUB"
@@ -677,6 +797,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print()
     # Детали цепочек
+    id2name = load_payment_dict()
     for i, p in enumerate(top, 1):
         rub_per_target = 1.0 / p.effective_rate if p.effective_rate > 0 else float("inf")
         print(f"--- Route #{i}: {' → '.join(p.chain)}  1 {p.chain[-1]} = {rub_per_target:.2f} {p.chain[0]} ---")
@@ -685,7 +806,9 @@ def main(argv: list[str] | None = None) -> None:
             step_str = f"1 {e.source} → {e.rate:.6f} {e.target}"
             print(f"  Step {j+1}: {step_str}")
             for m in top3_makers:
-                print(f"    {m.price:.2f} — {m.nickname}\n      {m.url}")
+                pays = _payment_names(m, id2name)
+                pays_str = f"  [{pays}]" if pays else ""
+                print(f"    {m.price:.2f} — {m.nickname}{pays_str}\n      {m.url}")
             print()
 
 
