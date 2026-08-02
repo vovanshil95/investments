@@ -1,20 +1,17 @@
-"""Fetch detailed info for each bond from TBank invest API and save to CSV.
+"""Fetch detailed info for each bond from the TBank invest API.
 
-Reads tickers from bonds_tickers.csv, fetches detail per ticker,
-saves to bonds_detail.csv. Supports resume: already-fetched tickers are skipped.
-Random delay ~1s between requests to avoid rate limiting.
+Every run re-fetches details for the given tickers fresh — there is no
+resume/cache file, so there is no risk of a schema mismatch between old
+and newly fetched rows.
 """
 
-import csv
 import random
 import time
-from pathlib import Path
 
+import pandas as pd
 import requests
 from tqdm import tqdm
 
-TICKERS_CSV = "bonds_tickers.csv"
-OUTPUT_CSV = "bonds_detail.csv"
 API_URL = "https://api.tinkoff.ru/trading/bonds/get"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
@@ -111,21 +108,6 @@ def parse_bond(payload: dict) -> dict:
     }
 
 
-def load_tickers() -> list[str]:
-    """Load tickers from bonds_tickers.csv."""
-    with open(TICKERS_CSV, encoding="utf-8") as f:
-        return [row["ticker"] for row in csv.DictReader(f)]
-
-
-def load_done() -> set[str]:
-    """Load already-fetched tickers from output CSV (for resume)."""
-    path = Path(OUTPUT_CSV)
-    if not path.exists():
-        return set()
-    with open(path, encoding="utf-8") as f:
-        return {row["ticker"] for row in csv.DictReader(f)}
-
-
 def fetch_detail(ticker: str, session: requests.Session) -> dict | None:
     """Fetch bond detail from API.
 
@@ -134,55 +116,48 @@ def fetch_detail(ticker: str, session: requests.Session) -> dict | None:
         session: requests Session
 
     Returns:
-        parsed flat dict or None on error
+        parsed flat dict, or None on error / API-side rejection
     """
     try:
         resp = session.get(API_URL, params={"ticker": ticker}, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") == "Error" or "payload" not in data:
-            print(f"  [warn] {ticker}: API error — {data.get('payload', {}).get('message', '?')}")
             return None
         return parse_bond(data["payload"])
-    except Exception as e:
-        print(f"  [error] {ticker}: {e}")
+    except Exception:
         return None
 
 
-def main() -> None:
-    tickers = load_tickers()
-    done = load_done()
-    remaining = [t for t in tickers if t not in done]
+def fetch_details(tickers: list[str]) -> pd.DataFrame:
+    """Fetch full detail for every given ticker.
 
-    print(f"Total: {len(tickers)} | Already done: {len(done)} | To fetch: {len(remaining)}")
+    Args:
+        tickers: bond tickers to fetch (e.g. from fetch_bonds.fetch_tickers())
 
-    write_header = not Path(OUTPUT_CSV).exists()
-    errors: list[str] = []
+    Returns:
+        DataFrame with columns matching FIELDS; tickers the API rejected are
+        silently skipped and reported in the returned errors count via print
 
-    with open(OUTPUT_CSV, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS)
-        if write_header:
-            writer.writeheader()
+    Example:
+        >>> tickers = fetch_bonds.fetch_tickers()["ticker"].tolist()
+        >>> df = fetch_details(tickers)
+        >>> df.columns.tolist() == FIELDS
+        True
+    """
+    rows = []
+    errors = []
+    session = requests.Session()
 
-        session = requests.Session()
+    for ticker in tqdm(tickers, desc="Fetching bonds", unit="bond"):
+        row = fetch_detail(ticker, session)
+        if row:
+            rows.append(row)
+        else:
+            errors.append(ticker)
+        time.sleep(random.uniform(0.5, 1.5))
 
-        for ticker in tqdm(remaining, desc="Fetching bonds", unit="bond"):
-            row = fetch_detail(ticker, session)
-            if row:
-                writer.writerow(row)
-                f.flush()
-            else:
-                errors.append(ticker)
-
-            # random delay: uniform 0.5–1.5s → mean 1s
-            time.sleep(random.uniform(0.5, 1.5))
-
-    print(f"\n\nDone. Saved to {OUTPUT_CSV}")
     if errors:
-        print(f"Errors ({len(errors)}): {', '.join(errors)}")
-        with open("bonds_errors.txt", "w") as ef:
-            ef.write("\n".join(errors))
+        print(f"Не удалось получить {len(errors)} из {len(tickers)}: {', '.join(errors)}")
 
-
-if __name__ == "__main__":
-    main()
+    return pd.DataFrame(rows, columns=FIELDS)

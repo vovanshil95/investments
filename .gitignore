@@ -2,5 +2,13 @@ __pycache__/
 *.pyc
 .DS_Store
 backup_*/
-bonds_errors.txt
 .ipynb_checkpoints/
+.venv/
+.env
+operations.csv
+bond_pnl.csv
+.claude/
+bonds_tickers.csv
+bonds_detail.csv
+bonds_filtered.csv
+bonds_analysis.html

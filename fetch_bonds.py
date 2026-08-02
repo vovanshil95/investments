@@ -1,13 +1,13 @@
-"""Fetch all bond tickers from TBank invest API and save to CSV."""
+"""Fetch the full bond ticker list from the TBank invest API."""
 
-import csv
 import time
+
+import pandas as pd
 import requests
 
 BASE_URL = "https://api.tinkoff.ru/trading/bonds/list"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 PAGE_SIZE = 100
-OUTPUT = "bonds_tickers.csv"
 
 
 def fetch_page(start: int, end: int) -> dict:
@@ -32,11 +32,19 @@ def fetch_page(start: int, end: int) -> dict:
     return resp.json()["payload"]
 
 
-def main() -> None:
-    """Fetch all bonds and write tickers to CSV."""
+def fetch_tickers() -> pd.DataFrame:
+    """Fetch every bond ticker currently listed on the exchange.
+
+    Returns:
+        DataFrame with columns ticker, isin, name, currency, sector, country
+
+    Example:
+        >>> df = fetch_tickers()
+        >>> df.columns.tolist()
+        ['ticker', 'isin', 'name', 'currency', 'sector', 'country']
+    """
     first = fetch_page(0, 1)
     total = first["total"]
-    print(f"Total bonds: {total}")
 
     rows = []
     for start in range(0, total, PAGE_SIZE):
@@ -52,16 +60,6 @@ def main() -> None:
                 "sector": sym.get("sector", ""),
                 "country": sym.get("countryOfRiskBriefName", ""),
             })
-        print(f"  fetched {end}/{total}")
         time.sleep(0.2)
 
-    with open(OUTPUT, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["ticker", "isin", "name", "currency", "sector", "country"])
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"\nSaved {len(rows)} bonds to {OUTPUT}")
-
-
-if __name__ == "__main__":
-    main()
+    return pd.DataFrame(rows)
