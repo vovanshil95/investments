@@ -784,6 +784,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--bank-section", type=str, default="mobile", choices=["mobile", "cash"],
         help="Тариф банка для --bank: mobile (приложение) или cash (отделение). Default: mobile",
     )
+    parser.add_argument(
+        "--top", type=int, default=5,
+        help="Сколько лучших маршрутов показать (default: 5)",
+    )
     return parser.parse_args(argv)
 
 
@@ -852,9 +856,10 @@ def main(argv: list[str] | None = None) -> None:
         print(f"No routes found from {source} to {target} (max {cfg.max_hops} hops)")
         sys.exit(0)
 
-    # Сортировка по score убыванию, топ-5
-    paths.sort(key=lambda p: p.score, reverse=True)
-    top = paths[:5]
+    # Сортировка: СТРОГО по выгодности — чем больше target за 1 RUB, тем выше.
+    # Число хопов — только тайбрейк при равном курсе (меньше хопов = выше).
+    paths.sort(key=lambda p: (p.effective_rate, -len(p.chain)), reverse=True)
+    top = paths[:max(1, args.top)]
 
     print()
     # Заголовок: эффективный курс RUB→Target, объём в RUB
