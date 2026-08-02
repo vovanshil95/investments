@@ -65,7 +65,7 @@ class Config:
     # Источник данных
     bybit_p2p_url: str = "https://api2.bybit.com/fiat/otc/item/online"
     bybit_p2p_page_size: int = 50           # объявлений на страницу
-    bybit_p2p_pages: int = 10               # сколько последних страниц запрашивать (там самые дешёвые)
+    bybit_p2p_pages: int = 0                # 0 = ВЕСЬ стакан (все страницы), N = только первые N
 
     # Фильтры мейкеров
     min_recent_order_num: int = 100
@@ -212,12 +212,11 @@ def fetch_ads(
 ) -> list[dict[str, Any]]:
     """Запросить P2P-объявления Bybit.
 
-    Раньше скрипт тянул ПОСЛЕДНИЕ страницы в надежде найти самые дешёвые
-    объявления. На практике сортировка api2.bybit.com нестабильна
-    (иногда дешёвые сначала, иногда с конца), а в конце стакана копятся
-    годами не обновлявшиеся объявления с неактуальными ценами — на них
-    скрипт и покупался. Поэтому берём первые N страниц и полагаемся на
-    фильтры свежести и анти-скам в filter_makers().
+    По умолчанию тянет ВЕСЬ стакан (все страницы), чтобы не пропускать
+    выгодные объявления, застрявшие глубоко в книге (сортировка api2.bybit.com
+    нестабильна — лучшая цена может быть не на первой странице).
+    Ограничить можно через cfg.bybit_p2p_pages или --pages N.
+    Мусор (годами висящие объявления) отсекают фильтры свежести и анти-скам.
     """
     use_v5 = bool(cfg.bybit_api_key and cfg.bybit_api_secret)
     page_size = cfg.bybit_p2p_page_size
@@ -255,8 +254,13 @@ def fetch_ads(
     # Сколько всего страниц?
     total_pages = max(1, math.ceil(total / page_size)) if total > 0 else 1
 
-    # Берём первые N страниц с начала (не с конца!)
-    pages_to_fetch = min(cfg.bybit_p2p_pages, total_pages)
+    # Запрашиваем страницы: если cfg.bybit_p2p_pages == 0 — ВЕСЬ стакан,
+    # иначе только первые N. Жёсткий потолок на пару — защита от аномалий.
+    max_pages = 50
+    if cfg.bybit_p2p_pages and cfg.bybit_p2p_pages > 0:
+        pages_to_fetch = min(cfg.bybit_p2p_pages, total_pages, max_pages)
+    else:
+        pages_to_fetch = min(total_pages, max_pages)
 
     for p in range(2, pages_to_fetch + 1):
         try:
@@ -790,6 +794,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--top", type=int, default=5,
         help="Сколько лучших маршрутов показать (default: 5)",
     )
+    parser.add_argument(
+        "--pages", type=int, default=None,
+        help="Сколько страниц стакана тянуть на пару. 0 = весь стакан (default: 0, весь)",
+    )
     return parser.parse_args(argv)
 
 
@@ -829,6 +837,8 @@ def main(argv: list[str] | None = None) -> None:
         use_bank_edges=args.bank,
         bank_rates_section=args.bank_section,
     )
+    if args.pages is not None:
+        cfg.bybit_p2p_pages = args.pages
 
     source = "RUB"
     target = args.target.upper()
