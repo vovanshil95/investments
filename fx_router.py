@@ -852,9 +852,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"No routes found from {source} to {target} (max {cfg.max_hops} hops)")
         sys.exit(0)
 
-    # Сортировка по score убыванию, топ-3
+    # Сортировка по score убыванию, топ-5
     paths.sort(key=lambda p: p.score, reverse=True)
-    top = paths[:3]
+    top = paths[:5]
 
     print()
     # Заголовок: эффективный курс RUB→Target, объём в RUB
