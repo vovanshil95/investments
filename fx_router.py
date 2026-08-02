@@ -70,9 +70,10 @@ class Config:
     # Фильтры мейкеров
     min_recent_order_num: int = 100
     min_recent_execute_rate: float = 99.0
+    require_online: bool = True        # False = допускать офлайн-мейкеров (могут не ответить)
     antiscam_threshold: float = 0.10  # отклонение от медианы всех валидных (±10%): режет старьё (-15%+), пускает реальные лучшие цены
-    max_ad_age_hours: float = 336.0   # объявления старше 14 дней — мусор (цены неактуальны)
-    blacklist_keywords: tuple[str, ...] = ("pyypl", "доверенн")
+    max_ad_age_hours: float = 720.0   # объявления старше 1 месяца — мусор (цены неактуальны)
+    blacklist_keywords: tuple[str, ...] = ("pyypl",)
 
     # Фильтры способов оплаты (по ID или подстроке названия, например "Freedom Bank").
     # pay_in_methods — как юзер ПЛАТИТ за крипту (side=1, фиат→крипта, мейкеры продают).
@@ -362,26 +363,31 @@ def load_payment_dict(client: httpx.Client | None = None) -> dict[str, str]:
     global _payment_dict
     if _payment_dict is not None:
         return _payment_dict
-    try:
-        own = client is None
-        client = client or httpx.Client()
+    for attempt in range(3):
         try:
-            resp = client.post(_PAYMENT_DICT_URL, json={}, timeout=10.0)
-            data = resp.json()
-        finally:
-            if own:
-                client.close()
-        d: dict[str, str] = {}
-        for cfg in (data.get("result", {}).get("paymentConfigVo") or []):
-            pid = cfg.get("paymentType")
-            nm = cfg.get("paymentName")
-            if pid and nm:
-                d[str(pid)] = str(nm)
-        _payment_dict = d
-        log.info("Payment dict loaded: %d methods", len(d))
-    except Exception as exc:
-        log.warning("Failed to load payment dict: %s", exc)
-        _payment_dict = {}
+            own = client is None
+            client = client or httpx.Client()
+            try:
+                resp = client.post(_PAYMENT_DICT_URL, json={}, timeout=15.0)
+                data = resp.json()
+            finally:
+                if own:
+                    client.close()
+            d: dict[str, str] = {}
+            for cfg in (data.get("result", {}).get("paymentConfigVo") or []):
+                pid = cfg.get("paymentType")
+                nm = cfg.get("paymentName")
+                if pid and nm:
+                    d[str(pid)] = str(nm)
+            _payment_dict = d
+            log.info("Payment dict loaded: %d methods", len(d))
+            return d
+        except Exception as exc:
+            if attempt < 2:
+                log.warning("Payment dict fetch failed (attempt %d/3): %s — retrying…", attempt + 1, exc)
+            else:
+                log.warning("Failed to load payment dict: %s", exc)
+    _payment_dict = {}
     return _payment_dict
 
 
@@ -478,22 +484,24 @@ def filter_makers(
 
     * ``recentOrderNum >= min_recent_order_num`` (30 в relaxed)
     * ``recentExecuteRate >= min_recent_execute_rate`` (97% в relaxed)
-    * мейкер онлайн
+    * мейкер онлайн (пропускается в relaxed)
     * лимиты объявления вмещают сумму
     * условие не содержит blacklist-подстрок
-    * объявление свежее ``max_ad_age_hours`` (пропускается в relaxed)
+    * объявление свежее ``max_ad_age_hours`` (1 месяц, действует и в relaxed)
     * если ``required_payment_ids`` задан — мейкер поддерживает хотя бы один из них
     * анти-скам: курс не отклоняется от медианы ВСЕХ валидных больше чем на ``antiscam_threshold``
     """
     total = len(makers)
     now_ms = time.time() * 1000
     min_orders = 30 if relaxed else cfg.min_recent_order_num
-    min_exec = 97.0 if relaxed else cfg.min_recent_execute_rate
+    min_exec = min(97.0, cfg.min_recent_execute_rate) if relaxed else cfg.min_recent_execute_rate
 
     # Базовые фильтры
     valid: list[Maker] = []
     for m in makers:
-        if not m.is_online:
+        if cfg.require_online and not relaxed and not m.is_online:
+            # в relaxed (тонкий рынок с фильтром оплаты) онлайн не обязателен —
+            # иначе теряем хорошие цены (мейкер может просто не светить статус)
             continue
         if m.recent_order_num < min_orders:
             continue
@@ -501,8 +509,9 @@ def filter_makers(
             continue
         if amount and (amount < m.min_amount or amount > m.max_amount):
             continue
-        # Свежесть: старые объявления висят годами с ценами из другой эпохи
-        if not relaxed and m.create_date_ms > 0 and (now_ms - m.create_date_ms) > cfg.max_ad_age_hours * 3600_000:
+        # Свежесть: старые объявления висят месяцами с ценами из другой эпохи.
+        # Лимит (1 месяц) действует и в strict, и в relaxed.
+        if m.create_date_ms > 0 and (now_ms - m.create_date_ms) > cfg.max_ad_age_hours * 3600_000:
             continue
         # Способ оплаты: мейкер должен поддерживать хотя бы один из требуемых
         if required_payment_ids and not (set(m.payments) & required_payment_ids):
@@ -579,6 +588,14 @@ def build_graph(
     id2name = load_payment_dict()
     pay_in_ids = resolve_payment_ids(cfg.pay_in_methods, id2name) if cfg.pay_in_methods else set()
     pay_out_ids = resolve_payment_ids(cfg.pay_out_methods, id2name) if cfg.pay_out_methods else set()
+    # Если юзер просил фильтр оплаты, а он не применился (справочник не загрузился
+    # или название не найдено) — НЕ продолжаем молча без фильтра: это давало бы
+    # ложные маршруты с чужими способами оплаты.
+    if (cfg.pay_in_methods and not pay_in_ids) or (cfg.pay_out_methods and not pay_out_ids):
+        log.error("Фильтр оплаты не применился: pay_in=%s pay_out=%s (справочник: %d методов)",
+                  cfg.pay_in_methods, cfg.pay_out_methods, len(id2name))
+        log.error("Перезапусти прогон или укажи числовые ID напрямую, напр. --pay-out 549")
+        sys.exit(1)
     if pay_in_ids:
         log.info("Pay-in filter: %s", sorted(pay_in_ids))
     if pay_out_ids:
@@ -620,11 +637,17 @@ def build_graph(
         if not makers:
             return None
         valid = filter_makers(makers, side, step_amount, cfg, req_pay or None)
-        if len(valid) < 3 and req_pay:
-            # Тонкий рынок (фильтр оплаты): пробуем ослабленные пороги
-            valid = filter_makers(makers, side, step_amount, cfg, req_pay or None, relaxed=True)
+        if req_pay:
+            # Тонкий рынок с фильтром оплаты: ВСЕГДА добавляем ослабленный проход и
+            # объединяем (иначе строгий проход может найти ровно 3 мейкера с худшими
+            # ценами и лучший оффер — например офлайн-мейкер с топ-ценой — потеряется).
+            relaxed_valid = filter_makers(makers, side, step_amount, cfg, req_pay or None, relaxed=True)
+            merged: dict[str, Maker] = {m.ad_id: m for m in valid}
+            for m in relaxed_valid:
+                merged.setdefault(m.ad_id, m)
+            valid = list(merged.values())
             if len(valid) >= 3:
-                log.info("  relaxed filters for %s→%s (payment filter)", src, dst)
+                log.info("  merged strict+relaxed for %s→%s: %d makers", src, dst, len(valid))
         if len(valid) < 3:
             return None
         raw_rate = _edge_rate(valid, side)
@@ -805,6 +828,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pages", type=int, default=None,
         help="Сколько страниц стакана тянуть на пару. 0 = весь стакан (default: 0, весь)",
     )
+    parser.add_argument(
+        "--min-exec", type=float, default=None,
+        help="Мин. % выполнения мейкера (default: 99). Напр. --min-exec 96",
+    )
+    parser.add_argument(
+        "--allow-offline", action="store_true",
+        help="Не отбрасывать офлайн-мейкеров (могут не ответить на сделку)",
+    )
+    parser.add_argument(
+        "--antiscam", type=float, default=None,
+        help="Полоса анти-скама, доля от медианы (default: 0.10). 0.96 = почти без фильтра",
+    )
     return parser.parse_args(argv)
 
 
@@ -846,6 +881,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     if args.pages is not None:
         cfg.bybit_p2p_pages = args.pages
+    if args.min_exec is not None:
+        cfg.min_recent_execute_rate = args.min_exec
+    if args.allow_offline:
+        cfg.require_online = False
+    if args.antiscam is not None:
+        cfg.antiscam_threshold = args.antiscam
 
     source = "RUB"
     target = args.target.upper()
@@ -913,7 +954,8 @@ def main(argv: list[str] | None = None) -> None:
             for m in top3_makers:
                 pays = _payment_names(m, id2name)
                 pays_str = f"  [{pays}]" if pays else ""
-                print(f"    {m.price:.2f} — {m.nickname}{pays_str}\n      {m.url}")
+                off = "  ⛔ ОФЛАЙН" if not m.is_online else ""
+                print(f"    {m.price:.2f} — {m.nickname}{off}{pays_str}\n      {m.url}")
             print()
 
 
