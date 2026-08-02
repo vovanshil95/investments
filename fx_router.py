@@ -72,7 +72,6 @@ class Config:
     min_recent_execute_rate: float = 99.0
     require_online: bool = True        # False = допускать офлайн-мейкеров (могут не ответить)
     antiscam_threshold: float = 0.10  # отклонение от медианы всех валидных (±10%): режет старьё (-15%+), пускает реальные лучшие цены
-    max_ad_age_hours: float = 720.0   # объявления старше 1 месяца — мусор (цены неактуальны)
     blacklist_keywords: tuple[str, ...] = ("pyypl",)
 
     # Фильтры способов оплаты (по ID или подстроке названия, например "Freedom Bank").
@@ -217,7 +216,7 @@ def fetch_ads(
     выгодные объявления, застрявшие глубоко в книге (сортировка api2.bybit.com
     нестабильна — лучшая цена может быть не на первой странице).
     Ограничить можно через cfg.bybit_p2p_pages или --pages N.
-    Мусор (годами висящие объявления) отсекают фильтры свежести и анти-скам.
+    Мусор (аномальные цены) отсекает анти-скам фильтр.
     """
     use_v5 = bool(cfg.bybit_api_key and cfg.bybit_api_secret)
     page_size = cfg.bybit_p2p_page_size
@@ -479,20 +478,18 @@ def filter_makers(
     это нужно при построении графа, когда реальный объём ещё неизвестен.
 
     ``relaxed=True`` — ослабленные пороги для тонких рынков (например, когда
-    активен фильтр способа оплаты): не проверяется свежесть, достаточно
-    30 сделок и 97% выполнения.
+    активен фильтр способа оплаты): достаточно 30 сделок и 97% выполнения,
+    онлайн не обязателен.
 
     * ``recentOrderNum >= min_recent_order_num`` (30 в relaxed)
     * ``recentExecuteRate >= min_recent_execute_rate`` (97% в relaxed)
     * мейкер онлайн (пропускается в relaxed)
     * лимиты объявления вмещают сумму
     * условие не содержит blacklist-подстрок
-    * объявление свежее ``max_ad_age_hours`` (1 месяц, действует и в relaxed)
     * если ``required_payment_ids`` задан — мейкер поддерживает хотя бы один из них
     * анти-скам: курс не отклоняется от медианы ВСЕХ валидных больше чем на ``antiscam_threshold``
     """
     total = len(makers)
-    now_ms = time.time() * 1000
     min_orders = 30 if relaxed else cfg.min_recent_order_num
     min_exec = min(97.0, cfg.min_recent_execute_rate) if relaxed else cfg.min_recent_execute_rate
 
@@ -508,10 +505,6 @@ def filter_makers(
         if m.recent_execute_rate < min_exec:
             continue
         if amount and (amount < m.min_amount or amount > m.max_amount):
-            continue
-        # Свежесть: старые объявления висят месяцами с ценами из другой эпохи.
-        # Лимит (1 месяц) действует и в strict, и в relaxed.
-        if m.create_date_ms > 0 and (now_ms - m.create_date_ms) > cfg.max_ad_age_hours * 3600_000:
             continue
         # Способ оплаты: мейкер должен поддерживать хотя бы один из требуемых
         if required_payment_ids and not (set(m.payments) & required_payment_ids):
