@@ -84,6 +84,9 @@ class Config:
     use_bank_edges: bool = False
     bank_rates_section: str = "mobile"   # "mobile" — приложение, "cash" — отделение
 
+    # --relaxed: строить ВСЕ рёбра по ослабленным порогам (не только там, где фильтр оплаты)
+    force_relaxed: bool = False
+
     # Поиск путей
     max_hops: int = 3
     amount_rub: float = 100_000.0  # сумма сделки в RUB
@@ -629,18 +632,22 @@ def build_graph(
         makers = parse_makers(raw)
         if not makers:
             return None
-        valid = filter_makers(makers, side, step_amount, cfg, req_pay or None)
-        if req_pay:
-            # Тонкий рынок с фильтром оплаты: ВСЕГДА добавляем ослабленный проход и
-            # объединяем (иначе строгий проход может найти ровно 3 мейкера с худшими
-            # ценами и лучший оффер — например офлайн-мейкер с топ-ценой — потеряется).
-            relaxed_valid = filter_makers(makers, side, step_amount, cfg, req_pay or None, relaxed=True)
-            merged: dict[str, Maker] = {m.ad_id: m for m in valid}
-            for m in relaxed_valid:
-                merged.setdefault(m.ad_id, m)
-            valid = list(merged.values())
-            if len(valid) >= 3:
-                log.info("  merged strict+relaxed for %s→%s: %d makers", src, dst, len(valid))
+        if cfg.force_relaxed:
+            # --relaxed: все рёбра по ослабленным порогам
+            valid = filter_makers(makers, side, step_amount, cfg, req_pay or None, relaxed=True)
+        else:
+            valid = filter_makers(makers, side, step_amount, cfg, req_pay or None)
+            if req_pay:
+                # Тонкий рынок с фильтром оплаты: ВСЕГДА добавляем ослабленный проход и
+                # объединяем (иначе строгий проход может найти ровно 3 мейкера с худшими
+                # ценами и лучший оффер — например офлайн-мейкер с топ-ценой — потеряется).
+                relaxed_valid = filter_makers(makers, side, step_amount, cfg, req_pay or None, relaxed=True)
+                merged: dict[str, Maker] = {m.ad_id: m for m in valid}
+                for m in relaxed_valid:
+                    merged.setdefault(m.ad_id, m)
+                valid = list(merged.values())
+                if len(valid) >= 3:
+                    log.info("  merged strict+relaxed for %s→%s: %d makers", src, dst, len(valid))
         if len(valid) < 3:
             return None
         raw_rate = _edge_rate(valid, side)
@@ -833,6 +840,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--antiscam", type=float, default=None,
         help="Полоса анти-скама, доля от медианы (default: 0.10). 0.96 = почти без фильтра",
     )
+    parser.add_argument(
+        "--relaxed", action="store_true",
+        help="Строить ВСЕ рёбра по ослабленным порогам (30 сделок, 97% выполнения, "
+             "онлайн не обязателен) — не только там, где задан фильтр оплаты",
+    )
     return parser.parse_args(argv)
 
 
@@ -871,6 +883,7 @@ def main(argv: list[str] | None = None) -> None:
         pay_out_methods=tuple(s.strip() for s in args.pay_out.split(",") if s.strip()),
         use_bank_edges=args.bank,
         bank_rates_section=args.bank_section,
+        force_relaxed=args.relaxed,
     )
     if args.pages is not None:
         cfg.bybit_p2p_pages = args.pages
