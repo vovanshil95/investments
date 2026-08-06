@@ -786,6 +786,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Целевая валюта (default: USD)",
     )
     parser.add_argument(
+        "--source", type=str, default="RUB",
+        help="Исходная валюта (default: RUB)",
+    )
+    parser.add_argument(
         "--max-hops", type=int, default=3,
         help="Макс. длина цепочки (default: 3)",
     )
@@ -894,7 +898,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.antiscam is not None:
         cfg.antiscam_threshold = args.antiscam
 
-    source = "RUB"
+    source = args.source.upper()
     target = args.target.upper()
 
     log.info(
